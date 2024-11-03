@@ -1,0 +1,11 @@
+{
+    "files.associations": {
+        "err.h": "c",
+        "stat.h": "c",
+        "array": "c",
+        "string_view": "c",
+        "initializer_list": "c",
+        "utility": "c",
+        "select.h": "c"
+    }
+}
