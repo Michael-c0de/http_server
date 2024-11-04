@@ -12,13 +12,18 @@ gcc https.c -lssl -lcrypto   -o https
 #include <openssl/err.h>
 #include <assert.h>
 #include <sys/select.h>
-
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <string.h>
 #define BufSize 1024 * 16
 
 typedef struct
 {
     long start;
     long end;
+    int flag;
 } Range;
 SSL_CTX *ctx;
 
@@ -26,7 +31,6 @@ int parse_range(const char *recv_buf, Range *range)
 {
     const char *range_header = "Range: ";
     const char *range_start = strstr(recv_buf, range_header);
-    range->start = range->end = -1;
     if (!range_start)
     {
         return 0; // 没有找到 Range 头
@@ -51,16 +55,18 @@ int parse_range(const char *recv_buf, Range *range)
     else if (sscanf(range_start, "%ld-", &range->start) == 1)
     {
         // 只解析 start，end 留空
+
+        range->end = -1;
         return 1;
     }
     else
     {
         // 处理不完整的范围（例如："-100"）
         sscanf(range_start, "-%ld", &range->end);
+        range->start = 0;
+
         return 1;
     }
-    range->start = range->start >= -1 ? range->start : -1;
-    range->end = range->end >= -1 ? range->end : -1;
 }
 
 int create_socket_listen(int port)
@@ -134,29 +140,28 @@ SSL_CTX *initSSL(const char *cert, const char *key)
     return ctx;
 }
 
-// 读取[from，to)范围内的数据写入套接字
-size_t range_write(SSL *ssl, FILE *f, long l, long r, char *reply_buf)
+void get_filetype(char *filename, char *filetype)
 {
-    long num_bytes = r - l;
-    assert(num_bytes >= 0);
-    if (fseek(f, l, SEEK_SET) == -1)
-        return -1;
-    long left_bytes = num_bytes;
-    size_t read_size = -1;
-    while (left_bytes > 0 && read_size)
-    {
-        long tmp_size = left_bytes > BufSize ? BufSize : left_bytes;
-        read_size = fread(reply_buf, 1, tmp_size, f);
-        SSL_write(ssl, reply_buf, read_size);
-        left_bytes -= read_size;
-    }
-    return num_bytes - left_bytes;
+
+    if (strstr(filename, ".html") || strstr(filename, ".php"))
+        strcpy(filetype, "text/html");
+    else if (strstr(filename, ".gif"))
+        strcpy(filetype, "image/gif");
+    else if (strstr(filename, ".png"))
+        strcpy(filetype, "image/png");
+    else if (strstr(filename, ".jpg"))
+        strcpy(filetype, "image/jpeg");
+    else if (strstr(filename, ".mp4"))
+        strcpy(filetype, "video/mp4");
+    else
+        strcpy(filetype, "text/plain");
 }
+
 void serve_file(SSL *ssl, char *filename, Range *r, char *reply_buf)
 {
 
-    FILE *f = fopen(filename, "rb");
-    if (f == NULL)
+    int f = open(filename, O_RDONLY);
+    if (f == -1)
     {
 
         memset(reply_buf, 0, BufSize);
@@ -167,25 +172,35 @@ void serve_file(SSL *ssl, char *filename, Range *r, char *reply_buf)
         SSL_write(ssl, reply_buf, strlen(reply_buf));
         return;
     }
+    struct stat s;
+    fstat(f, &s);
     // 获取文件大小
-    fseek(f, 0, SEEK_END);
-    size_t fsize = ftell(f);
-    int state = r->start == -1 && r->end == -1 ? 200 : 206;
-    r->start = r->start == -1 ? 0 : r->start;
+    size_t fsize = s.st_size;
+    int state = r->flag == 0 ? 200 : 200;
+
     r->end = r->end == -1 || r->end - 1 > fsize ? fsize - 1 : r->end;
     // 响应头
     memset(reply_buf, 0, BufSize);
+    char filetype[0x20];
+    memset(filetype, 0, 0x20);
+    get_filetype(filename, filetype);
+
     snprintf(reply_buf, BufSize,
              "HTTP/1.1 %d OK\r\n"
-             "Content-Type: text/html; charset=UTF-8\r\n"
+             "Content-Type: %s\r\n"
              "Content-Length: %ld\r\n"
-             "Connection: close\r\n"
              "\r\n",
-             state, r->end - r->start + 1);
+             state,
+             filetype,
+             r->end - r->start + 1);
     SSL_write(ssl, reply_buf, strlen(reply_buf));
-    // 循环读取和写入
-    range_write(ssl, f, r->start, r->end + 1, reply_buf);
-    fclose(f);
+
+    void *buffer = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, f, 0);
+    size_t wsize = r->end - r->start + 1;
+    SSL_write(ssl, buffer + r->start, wsize);
+    printf("SSL_write(%ld %ld)\n", r->start, r->end);
+    munmap(buffer, fsize);
+    close(f);
 }
 
 void handle_http(int client)
@@ -194,23 +209,28 @@ void handle_http(int client)
     memset(buffer, 0, BufSize);
 
     read(client, buffer, BufSize);
+
     char *filename = strtok(buffer, " ");
+    if (filename == NULL)
+        goto http_end;
     filename = strtok(NULL, " ");
 
     if (filename && filename[0] == '/')
     {
         filename++;
     }
+
     char *name = strdup(filename);
     memset(buffer, 0, BufSize);
     snprintf(buffer, BufSize,
              "HTTP/1.1 301 Moved Permanently\r\n"
-             "Location: https://10.0.0.1/%s\r\n"
+             "Location: https://192.168.93.128/%s\r\n"
              "Connection: close\r\n"
              "\r\n",
              name);
     free(name);
     write(client, buffer, strlen(buffer));
+http_end:
     close(client);
 }
 void *handle_https(void *args)
@@ -230,15 +250,23 @@ void *handle_https(void *args)
 
     SSL_read(ssl, buffer, BufSize);
     Range range;
-    parse_range(buffer, &range);
+    memset(&range, 0, sizeof(range));
+    range.flag = parse_range(buffer, &range);
 
-    char *filename = strtok(buffer, " ");
-    filename = strtok(NULL, " ");
-
-    if (filename && filename[0] == '/')
+    char method[10];
+    char path[256];
+    char version[10];
+    if (sscanf(buffer, "%s %s %s", method, path, version) == 3)
     {
-        filename++;
+        printf("Method: %s\n", method);
+        printf("Path: %s\n", path);
+        printf("Version: %s\n", version);
     }
+    else
+    {
+        printf("Failed to parse HTTP request.\n");
+    }
+    char *filename = &path[1];
 
     serve_file(ssl, filename, &range, buffer);
 
