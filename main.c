@@ -17,6 +17,7 @@ gcc https.c -lssl -lcrypto   -o https
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <string.h>
+#include "thpool.h"
 #define BufSize 1024 * 16
 
 typedef struct
@@ -142,7 +143,6 @@ SSL_CTX *initSSL(const char *cert, const char *key)
 
 void get_filetype(char *filename, char *filetype)
 {
-
     if (strstr(filename, ".html") || strstr(filename, ".php"))
         strcpy(filetype, "text/html");
     else if (strstr(filename, ".gif"))
@@ -176,23 +176,39 @@ void serve_file(SSL *ssl, char *filename, Range *r, char *reply_buf)
     fstat(f, &s);
     // 获取文件大小
     size_t fsize = s.st_size;
-    int state = r->flag == 0 ? 200 : 200;
+    int state = r->flag == 0 ? 200 : 206;
 
     r->end = r->end == -1 || r->end - 1 > fsize ? fsize - 1 : r->end;
+
     // 响应头
-    memset(reply_buf, 0, BufSize);
     char filetype[0x20];
     memset(filetype, 0, 0x20);
     get_filetype(filename, filetype);
+    memset(reply_buf, 0, BufSize);
 
-    snprintf(reply_buf, BufSize,
-             "HTTP/1.1 %d OK\r\n"
+    char temp[BufSize];
+    memset(temp, 0, BufSize);
+    snprintf(temp, BufSize,
+             "HTTP/1.0 %d %s\r\n"
              "Content-Type: %s\r\n"
-             "Content-Length: %ld\r\n"
-             "\r\n",
+             "Content-Length: %ld\r\n",
              state,
+             state == 200 ? "OK" : "Partial Content",
              filetype,
              r->end - r->start + 1);
+    strcat(reply_buf, temp);
+
+    if (state == 206)
+    {
+        memset(temp, 0, BufSize);
+        snprintf(temp, BufSize,
+                 "Accept-Ranges: bytes\r\n"
+                 "Content-Range: bytes %ld-%ld/%ld\r\n",
+                 r->start, r->end, fsize);
+        strcat(reply_buf, temp);
+    }
+
+    strcat(reply_buf, "\r\n");
     SSL_write(ssl, reply_buf, strlen(reply_buf));
 
     void *buffer = mmap(NULL, fsize, PROT_READ, MAP_PRIVATE, f, 0);
@@ -233,7 +249,7 @@ void handle_http(int client)
 http_end:
     close(client);
 }
-void *handle_https(void *args)
+void handle_https(void *args)
 {
     char buffer[BufSize];
     memset(buffer, 0, BufSize);
@@ -274,7 +290,6 @@ end:
     SSL_shutdown(ssl);
     SSL_free(ssl);
     close(client);
-    return NULL;
 }
 
 int main(int argc, char **argv)
@@ -287,7 +302,7 @@ int main(int argc, char **argv)
     int fd2 = create_socket_listen(443);
     fd_set fds;
     int max_sd = (fd1 > fd2) ? fd1 : fd2;
-
+    threadpool thpool = thpool_init(1000);
     /* Handle connections */
     while (1)
     {
@@ -320,20 +335,12 @@ int main(int argc, char **argv)
                 perror("Unable to accept");
                 exit(EXIT_FAILURE);
             }
-            pthread_t pid;
-            if (pthread_create(&pid, NULL, handle_https, client) != 0)
-            {
-                perror("Faild to create thread");
-                close(*client);
-                free(client);
-            }
-            else
-            {
-                pthread_detach(pid);
-            }
+            handle_https(client);
+            thpool_add_work(thpool, handle_https, client);
         }
     }
-
+    thpool_wait(thpool);
+    thpool_destroy(thpool);
     close(fd1);
     close(fd2);
     SSL_CTX_free(ctx);
